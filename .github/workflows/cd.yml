@@ -1,0 +1,94 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to EC2 over SSH
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          DEPLOY_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: DEPLOY_SHA
+          script: |
+            set -Eeuo pipefail
+
+            export PATH="/usr/local/bin:/usr/bin:/bin"
+
+            # Validate required commands.
+            command -v node >/dev/null
+            command -v pnpm >/dev/null
+            command -v pm2 >/dev/null
+            command -v git >/dev/null
+            command -v curl >/dev/null
+
+            # Ensure this SSH session targets the correct PM2 daemon.
+            export PM2_HOME="/home/sahil_dev/.pm2"
+
+            cd /opt/chai-learn
+
+            # Deploy the exact commit CI validated.
+            git fetch --quiet origin main
+            git cat-file -e "${DEPLOY_SHA}^{commit}"
+            git reset --hard "$DEPLOY_SHA"
+
+            # ---------- Backend ----------
+            pnpm --dir backend install --frozen-lockfile
+
+            # Apply Drizzle migrations using production environment.
+            # Ensure .env.production is loaded by your migration command.
+            set -a
+            . /opt/chai-learn/backend/.env.production
+            set +a
+
+            NODE_ENV=production pnpm --dir backend run db:migrate:prod
+
+            # ---------- Frontend ----------
+            pnpm --dir frontend install --frozen-lockfile
+
+            # Vite reads .env.production during the production build.
+            # Ensure VITE_API_URL is set correctly in this file.
+            pnpm --dir frontend run build
+
+            # ---------- Reload PM2 processes ----------
+            # Run as sahil_dev, matching the existing PM2 daemon.
+            pm2 reload backend
+            pm2 reload frontend
+
+            # ---------- Health checks ----------
+            for i in $(seq 1 10); do
+              if curl --fail --silent --show-error \
+                  http://127.0.0.1:3000/api/health >/dev/null \
+                 && curl --fail --silent \
+                  http://127.0.0.1:3001/ >/dev/null; then
+                echo "Backend and frontend health checks passed."
+                pm2 save
+                exit 0
+              fi
+
+              echo "Waiting for applications to become healthy ($i/10)..."
+              sleep 3
+            done
+
+            echo "Deployment health check failed."
+            pm2 status
+            pm2 logs --lines 50 --nostream
+            exit 1
